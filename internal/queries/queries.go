@@ -138,6 +138,45 @@ LIMIT 1`
 	return launch, nil
 }
 
+func (s *Store) GetLaunchByAsset(ctx context.Context, assetAddress string, chainID int) (models.Launch, error) {
+	query := `
+SELECT
+    p.address,
+    p.chain_id,
+    p.asset,
+    p.type,
+    p.created_at,
+    COALESCE(p.migrated_at, 0),
+    COALESCE(p.total_tokens_sold, 0),
+    COALESCE(t.symbol, ''),
+    COALESCE(t.name, ''),
+    COALESCE(t.image, '')
+FROM pool p
+LEFT JOIN token t ON t.address = p.asset AND t.chain_id = p.chain_id
+WHERE p.asset = $1 AND p.chain_id = $2
+ORDER BY p.created_at DESC
+LIMIT 1`
+
+	row := s.pool.QueryRow(ctx, query, strings.ToLower(assetAddress), chainID)
+	var launch models.Launch
+	if err := row.Scan(
+		&launch.Address,
+		&launch.ChainID,
+		&launch.Asset,
+		&launch.Type,
+		&launch.CreatedAt,
+		&launch.MigratedAt,
+		&launch.TotalTokensSold,
+		&launch.Symbol,
+		&launch.Name,
+		&launch.Image,
+	); err != nil {
+		return models.Launch{}, fmt.Errorf("get launch by asset: %w", err)
+	}
+
+	return launch, nil
+}
+
 func (s *Store) GetLaunchSwaps(ctx context.Context, poolAddress string, chainID int, migratedAt int64) ([]models.Swap, error) {
 	query := `
 SELECT
@@ -168,6 +207,69 @@ ORDER BY s.timestamp ASC, s.tx_hash ASC`
 	}
 
 	return swaps, nil
+}
+
+func (s *Store) StreamLaunchSwaps(ctx context.Context, poolAddress string, chainID int, migratedAt int64, pageSize int, consume func([]models.Swap) error) error {
+	if pageSize <= 0 {
+		pageSize = 500
+	}
+
+	query := `
+SELECT
+    s.tx_hash,
+    s.pool,
+    s.chain_id,
+    s."user",
+    s.type,
+    s.amount_in,
+    s.amount_out,
+    s.swap_value_usd,
+    s.timestamp
+FROM swap s
+WHERE s.pool = $1
+  AND s.chain_id = $2
+  AND ($3 = 0 OR s.timestamp <= $3)
+ORDER BY s.timestamp ASC, s.tx_hash ASC`
+
+	rows, err := s.pool.Query(ctx, query, strings.ToLower(poolAddress), chainID, migratedAt)
+	if err != nil {
+		return fmt.Errorf("stream launch swaps: %w", err)
+	}
+	defer rows.Close()
+
+	page := make([]models.Swap, 0, pageSize)
+	for rows.Next() {
+		var swap models.Swap
+		if err := rows.Scan(
+			&swap.TxHash,
+			&swap.Pool,
+			&swap.ChainID,
+			&swap.User,
+			&swap.Type,
+			&swap.AmountIn,
+			&swap.AmountOut,
+			&swap.SwapValueUSD,
+			&swap.Timestamp,
+		); err != nil {
+			return fmt.Errorf("scan streamed swap: %w", err)
+		}
+		page = append(page, swap)
+		if len(page) == pageSize {
+			if err := consume(page); err != nil {
+				return err
+			}
+			page = make([]models.Swap, 0, pageSize)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate streamed swaps: %w", err)
+	}
+	if len(page) > 0 {
+		if err := consume(page); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) CountLaunchSwaps(ctx context.Context, poolAddress string, chainID int, migratedAt int64) (int, error) {

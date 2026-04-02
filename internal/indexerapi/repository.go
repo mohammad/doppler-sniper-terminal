@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,7 +17,6 @@ import (
 
 const DefaultGraphQLEndpoint = "https://testnet-indexer.doppler.lol/graphql"
 const maxSwapPageSize = 500
-const maxLaunchSwaps = 5000
 
 type Repository struct {
 	endpoint string
@@ -124,26 +124,34 @@ func (r *Repository) ListMigratedLaunches(ctx context.Context, filter models.Lau
 		chainID = filter.ChainIDs[0]
 	}
 
-	whereParts := []string{"migrated: true"}
+	whereParts := make([]string, 0, 4)
 	if chainID > 0 {
 		whereParts = append(whereParts, fmt.Sprintf("chainId: %d", chainID))
 	}
 
 	switch filter.CurveType {
+	case "", "all":
+		if chainID == 8453 {
+			whereParts = append(whereParts, `type: "zora"`)
+		}
 	case "multicurve":
 		whereParts = append(whereParts, `type_contains: "multicurve"`)
 	case "standard-v4":
 		whereParts = append(whereParts, `type_in: ["v4", "v4-decay"]`)
 	case "v3":
 		whereParts = append(whereParts, `type: "v3"`)
+	case "zora":
+		whereParts = append(whereParts, `type: "zora"`)
 	}
 
 	if filter.DateRange != "" && filter.DateRange != "all" {
 		days := map[string]int{"7d": 7, "30d": 30, "90d": 90}[filter.DateRange]
 		if days > 0 {
-			whereParts = append(whereParts, fmt.Sprintf("migratedAt_gte: \"%d\"", time.Now().AddDate(0, 0, -days).Unix()))
+			whereParts = append(whereParts, fmt.Sprintf("lastSwapTimestamp_gte: \"%d\"", time.Now().AddDate(0, 0, -days).Unix()))
 		}
 	}
+
+	whereParts = append(whereParts, "lastSwapTimestamp_not: null")
 
 	limit := filter.Limit
 	if limit <= 0 {
@@ -154,7 +162,7 @@ func (r *Repository) ListMigratedLaunches(ctx context.Context, filter models.Lau
 query {
   pools(
     where: { %s }
-    orderBy: "migratedAt"
+    orderBy: "lastSwapTimestamp"
     orderDirection: "desc"
     limit: %d
   ) {
@@ -220,6 +228,80 @@ query {
 	return launches, nil
 }
 
+func (r *Repository) GetLaunchByAsset(ctx context.Context, assetAddress string, chainID int) (models.Launch, error) {
+	query := fmt.Sprintf(`
+query {
+  token(address: "%s", chainId: %d) {
+    address
+    symbol
+    name
+    pool {
+      address
+      chainId
+      type
+      createdAt
+      migratedAt
+      totalTokensSold
+      baseToken {
+        symbol
+        name
+        image
+      }
+    }
+  }
+}`, strings.ToLower(assetAddress), chainID)
+
+	type data struct {
+		Token *struct {
+			Address string `json:"address"`
+			Symbol  string `json:"symbol"`
+			Name    string `json:"name"`
+			Pool    *struct {
+				Address         string `json:"address"`
+				ChainID         int    `json:"chainId"`
+				Type            string `json:"type"`
+				CreatedAt       string `json:"createdAt"`
+				MigratedAt      string `json:"migratedAt"`
+				TotalTokensSold string `json:"totalTokensSold"`
+				BaseToken       struct {
+					Symbol string `json:"symbol"`
+					Name   string `json:"name"`
+					Image  string `json:"image"`
+				} `json:"baseToken"`
+			} `json:"pool"`
+		} `json:"token"`
+	}
+
+	var resp graphQLResponse[data]
+	if err := r.do(ctx, query, &resp); err != nil {
+		return models.Launch{}, err
+	}
+	if err := firstError(resp); err != nil {
+		return models.Launch{}, fmt.Errorf("get asset launch: %w", err)
+	}
+	if resp.Data.Token == nil || resp.Data.Token.Pool == nil {
+		return models.Launch{}, fmt.Errorf("%w: %s", ErrAssetLookupFailed, strings.ToLower(assetAddress))
+	}
+
+	token := resp.Data.Token
+	pool := token.Pool
+	symbol := firstNonEmpty(pool.BaseToken.Symbol, token.Symbol)
+	name := firstNonEmpty(pool.BaseToken.Name, token.Name)
+
+	return models.Launch{
+		Address:         strings.ToLower(pool.Address),
+		ChainID:         pool.ChainID,
+		Asset:           strings.ToLower(token.Address),
+		Type:            pool.Type,
+		CreatedAt:       parseInt64(pool.CreatedAt),
+		MigratedAt:      parseInt64(pool.MigratedAt),
+		TotalTokensSold: parseInt64(pool.TotalTokensSold),
+		Symbol:          symbol,
+		Name:            name,
+		Image:           pool.BaseToken.Image,
+	}, nil
+}
+
 func (r *Repository) CountLaunchSwaps(ctx context.Context, poolAddress string, chainID int, migratedAt int64) (int, error) {
 	swapArgs := `limit: 1`
 	if migratedAt > 0 {
@@ -276,7 +358,7 @@ func (r *Repository) GetLaunchSwaps(ctx context.Context, poolAddress string, cha
 	}
 
 	swaps := make([]models.Swap, 0, maxSwapPageSize)
-	for offset := 0; offset < maxLaunchSwaps; offset += maxSwapPageSize {
+	for offset := 0; ; offset += maxSwapPageSize {
 		swapArgs := fmt.Sprintf(`orderBy: "timestamp", orderDirection: "asc", limit: %d, offset: %d`, maxSwapPageSize, offset)
 		if migratedAt > 0 {
 			swapArgs = fmt.Sprintf(`where: { timestamp_lte: "%d" }, orderBy: "timestamp", orderDirection: "asc", limit: %d, offset: %d`, migratedAt, maxSwapPageSize, offset)
@@ -337,6 +419,96 @@ query {
 	return swaps, nil
 }
 
+func (r *Repository) StreamLaunchSwaps(ctx context.Context, poolAddress string, chainID int, migratedAt int64, pageSize int, consume func([]models.Swap) error) error {
+	if pageSize <= 0 {
+		pageSize = maxSwapPageSize
+	}
+
+	type swapItem struct {
+		TxHash       string `json:"txHash"`
+		ChainID      int    `json:"chainId"`
+		User         string `json:"user"`
+		Type         string `json:"type"`
+		AmountIn     string `json:"amountIn"`
+		AmountOut    string `json:"amountOut"`
+		SwapValueUSD string `json:"swapValueUsd"`
+		Timestamp    string `json:"timestamp"`
+	}
+	type data struct {
+		Pool *struct {
+			Swaps struct {
+				Items []swapItem `json:"items"`
+			} `json:"swaps"`
+		} `json:"pool"`
+	}
+
+	for offset := 0; ; offset += pageSize {
+		swapArgs := fmt.Sprintf(`orderBy: "timestamp", orderDirection: "asc", limit: %d, offset: %d`, pageSize, offset)
+		if migratedAt > 0 {
+			swapArgs = fmt.Sprintf(`where: { timestamp_lte: "%d" }, orderBy: "timestamp", orderDirection: "asc", limit: %d, offset: %d`, migratedAt, pageSize, offset)
+		}
+
+		query := fmt.Sprintf(`
+query {
+  pool(address: "%s", chainId: %d) {
+    swaps(%s) {
+      items {
+        txHash
+        chainId
+        user
+        type
+        amountIn
+        amountOut
+        swapValueUsd
+        timestamp
+      }
+    }
+  }
+}`, strings.ToLower(poolAddress), chainID, swapArgs)
+
+		var resp graphQLResponse[data]
+		if err := r.do(ctx, query, &resp); err != nil {
+			return err
+		}
+		if err := firstError(resp); err != nil {
+			return fmt.Errorf("stream swaps: %w", err)
+		}
+		if resp.Data.Pool == nil || len(resp.Data.Pool.Swaps.Items) == 0 {
+			break
+		}
+
+		page := make([]models.Swap, 0, len(resp.Data.Pool.Swaps.Items))
+		for _, item := range resp.Data.Pool.Swaps.Items {
+			timestamp := parseInt64(item.Timestamp)
+			if migratedAt > 0 && timestamp > migratedAt {
+				continue
+			}
+			page = append(page, models.Swap{
+				TxHash:       item.TxHash,
+				Pool:         strings.ToLower(poolAddress),
+				ChainID:      item.ChainID,
+				User:         strings.ToLower(item.User),
+				Type:         item.Type,
+				AmountIn:     parseInt64(item.AmountIn),
+				AmountOut:    parseInt64(item.AmountOut),
+				SwapValueUSD: parseInt64(item.SwapValueUSD),
+				Timestamp:    timestamp,
+			})
+		}
+
+		if len(page) > 0 {
+			if err := consume(page); err != nil {
+				return err
+			}
+		}
+
+		if len(resp.Data.Pool.Swaps.Items) < pageSize {
+			break
+		}
+	}
+	return nil
+}
+
 func (r *Repository) GetLatestSwapTimestamp(ctx context.Context) (int64, error) {
 	query := `
 query {
@@ -377,4 +549,15 @@ func parseInt64(value string) int64 {
 		return n
 	}
 	return 0
+}
+
+var ErrAssetLookupFailed = errors.New("asset lookup failed")
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
