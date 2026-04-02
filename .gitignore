@@ -1,0 +1,9 @@
+.DS_Store
+.env
+
+# Local build output
+server
+
+# Go test and coverage artifacts
+*.out
+coverage/
